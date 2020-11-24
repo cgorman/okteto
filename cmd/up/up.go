@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/analytics"
 	buildCMD "github.com/okteto/okteto/pkg/cmd/build"
+	"github.com/okteto/okteto/pkg/config"
 	"github.com/okteto/okteto/pkg/errors"
 	k8Client "github.com/okteto/okteto/pkg/k8s/client"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
@@ -41,6 +43,7 @@ import (
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/registry"
 	"github.com/okteto/okteto/pkg/ssh"
 
 	"github.com/okteto/okteto/pkg/k8s/forward"
@@ -79,9 +82,14 @@ func Up() *cobra.Command {
 
 			u := upgradeAvailable()
 			if len(u) > 0 {
-				log.Yellow("Okteto %s is available. To upgrade:", u)
-				log.Yellow("    %s", getUpgradeCommand())
-				fmt.Println()
+				warningFolder := filepath.Join(config.GetOktetoHome(), ".warnings")
+				if utils.GetWarningState(warningFolder, "version") != u {
+					log.Yellow("Okteto %s is available. To upgrade:", u)
+					log.Yellow("    %s", getUpgradeCommand())
+					if err := utils.SetWarningState(warningFolder, "version", u); err != nil {
+						log.Infof("failed to set warning version state: %s", err.Error())
+					}
+				}
 			}
 
 			if syncthing.ShouldUpgrade() {
@@ -109,6 +117,10 @@ func Up() *cobra.Command {
 
 			if err := loadDevOverrides(dev, namespace, k8sContext, forcePull, remote); err != nil {
 				return err
+			}
+
+			if err := checkStignoreConfiguration(dev); err != nil {
+				log.Infof("failed to check '.stignore' configuration: %s", err.Error())
 			}
 
 			if _, ok := os.LookupEnv("OKTETO_AUTODEPLOY"); ok {
@@ -201,7 +213,9 @@ func (up *upContext) start(autoDeploy, build bool) error {
 	var err error
 	up.Client, up.RestConfig, namespace, err = k8Client.GetLocal(up.Dev.Context)
 	if err != nil {
-		return fmt.Errorf("failed to load your local Kubeconfig: %s", err)
+		kubecfg := config.GetKubeConfigFile()
+		log.Infof("failed to load local Kubeconfig: %s", err)
+		return fmt.Errorf("failed to load your local Kubeconfig: %q context not found in %q", up.Dev.Context, kubecfg)
 	}
 
 	if up.Dev.Namespace == "" {
@@ -252,16 +266,42 @@ func (up *upContext) start(autoDeploy, build bool) error {
 // activateLoop activates the development container in a retry loop
 func (up *upContext) activateLoop(autoDeploy, build bool) {
 	isRetry := false
+	isTransientError := false
+	t := time.NewTicker(1 * time.Second)
+	iter := 0
+	defer t.Stop()
+
 	for {
+		if isRetry || isTransientError {
+			log.Infof("waiting for shutdown sequence to finish")
+			<-up.ShutdownCompleted
+			if iter == 0 {
+				log.Yellow("Connection lost to your development container, reconnecting...")
+			}
+			iter++
+			iter = iter % 10
+			if isTransientError {
+				<-t.C
+			}
+		}
 		err := up.activate(isRetry, autoDeploy, build)
 		if err != nil {
+			log.Infof("activate failed with: %s", err)
+
 			if err == errors.ErrLostSyncthing {
 				isRetry = true
+				isTransientError = false
+				iter = 0
 				continue
-			} else {
-				up.Exit <- err
-				return
 			}
+
+			if errors.IsTransient(err) {
+				isTransientError = true
+				continue
+			}
+
+			up.Exit <- err
+			return
 		}
 		up.Exit <- nil
 		return
@@ -269,10 +309,13 @@ func (up *upContext) activateLoop(autoDeploy, build bool) {
 }
 
 func (up *upContext) activate(isRetry, autoDeploy, build bool) error {
+	log.Infof("activating development container retry=%t", isRetry)
 	// create a new context on every iteration
 	ctx, cancel := context.WithCancel(context.Background())
 	up.Cancel = cancel
-	up.Canceled = false
+	up.ShutdownCompleted = make(chan bool, 1)
+	up.Sy = nil
+	up.Forwarder = nil
 	defer up.shutdown()
 
 	up.Disconnect = make(chan error, 1)
@@ -291,9 +334,18 @@ func (up *upContext) activate(isRetry, autoDeploy, build bool) error {
 
 	if deployments.IsDevModeOn(d) && deployments.HasBeenChanged(d) {
 		return errors.UserError{
-			E:    fmt.Errorf("Deployment '%s' has been modified while your development container was active", d.Name),
-			Hint: "Follow these steps:\n      1. Execute 'okteto down'\n      2. Apply your manifest changes again: 'kubectl apply'\n      3. Execute 'okteto up' again\n    More information is available here: https://okteto.com/docs/reference/known-issues/index.html#kubectl-apply-changes-are-undone-by-okteto-up",
+			E: fmt.Errorf("Deployment '%s' has been modified while your development container was active", d.Name),
+			Hint: `Follow these steps:
+	  1. Execute 'okteto down'
+	  2. Apply your manifest changes again: 'kubectl apply'
+	  3. Execute 'okteto up' again
+    More information is available here: https://okteto.com/docs/reference/known-issues/index.html#kubectl-apply-changes-are-undone-by-okteto-up`,
 		}
+	}
+
+	if _, err := registry.GetImageTagWithDigest(ctx, up.Dev.Image.Name); err == errors.ErrNotFound {
+		log.Infof("image '%s' not found, building it: %s", up.Dev.Image.Name, err.Error())
+		build = true
 	}
 
 	if !isRetry && build {
@@ -314,20 +366,29 @@ func (up *upContext) activate(isRetry, autoDeploy, build bool) error {
 		return fmt.Errorf("couldn't activate your development container (%s): %s", up.Dev.Container, err.Error())
 	}
 
+	log.Success("Development container activated")
+
 	if err := up.forwards(ctx); err != nil {
-		return fmt.Errorf("couldn't forward traffic to your development container: %s", err.Error())
+		if err == errors.ErrSSHConnectError {
+			err := up.checkOktetoStartError(ctx, "Failed to connect to your development container")
+			if err == errors.ErrLostSyncthing {
+				if err := pods.Destroy(ctx, up.Pod, up.Dev.Namespace, up.Client); err != nil {
+					return fmt.Errorf("error recreating development container: %s", err.Error())
+				}
+			}
+			return err
+		}
+		return fmt.Errorf("couldn't connect to your development container: %s", err.Error())
 	}
+	log.Success("Connected to your development container")
 
 	go up.cleanCommand(ctx)
-
-	log.Success("Development container activated")
 
 	if err := up.sync(ctx); err != nil {
 		if up.shouldRetry(ctx, err) {
 			if pods.Exists(ctx, up.Pod, up.Dev.Namespace, up.Client) {
 				up.resetSyncthing = true
 			}
-			log.Yellow("\nConnection lost to your development container, reconnecting...\n")
 			return errors.ErrLostSyncthing
 		}
 		return err
@@ -344,9 +405,15 @@ func (up *upContext) activate(isRetry, autoDeploy, build bool) error {
 		log.Debugf("clean command output: %s", output)
 
 		if isWatchesConfigurationTooLow(output) {
-			log.Yellow("\nThe value of /proc/sys/fs/inotify/max_user_watches in your cluster nodes is too low.")
-			log.Yellow("This can affect file synchronization performance.")
-			log.Yellow("Visit https://okteto.com/docs/reference/known-issues/index.html for more information.")
+			folder := config.GetNamespaceHome(up.Dev.Namespace)
+			if utils.GetWarningState(folder, ".remotewatcher") == "" {
+				log.Yellow("The value of /proc/sys/fs/inotify/max_user_watches in your cluster nodes is too low.")
+				log.Yellow("This can affect file synchronization performance.")
+				log.Yellow("Visit https://okteto.com/docs/reference/known-issues/index.html for more information.")
+				if err := utils.SetWarningState(folder, ".remotewatcher", "true"); err != nil {
+					log.Infof("failed to set warning remotewatcher state: %s", err.Error())
+				}
+			}
 		}
 
 		printDisplayContext(up.Dev)
@@ -356,7 +423,6 @@ func (up *upContext) activate(isRetry, autoDeploy, build bool) error {
 	prevError := up.waitUntilExitOrInterrupt()
 
 	if up.shouldRetry(ctx, prevError) {
-		log.Yellow("\nConnection lost to your development container, reconnecting...\n")
 		if !up.Dev.PersistentVolumeEnabled() {
 			if err := pods.Destroy(ctx, up.Pod, up.Dev.Namespace, up.Client); err != nil {
 				return err
@@ -378,10 +444,7 @@ func (up *upContext) shouldRetry(ctx context.Context, err error) bool {
 	case errors.ErrLostSyncthing:
 		return true
 	case errors.ErrCommandFailed:
-		if up.Sy.Ping(ctx, false) {
-			return false
-		}
-		return true
+		return !up.Sy.Ping(ctx, false)
 	}
 
 	return false
@@ -404,7 +467,7 @@ func (up *upContext) getCurrentDeployment(ctx context.Context, autoDeploy, isRet
 		if err == errors.ErrNotFound {
 			err = errors.UserError{
 				E:    fmt.Errorf("Didn't find a deployment in namespace %s that matches the labels in your Okteto manifest", up.Dev.Namespace),
-				Hint: "Update your labels or use `okteto namespace` to select a different namespace and try again"}
+				Hint: "Update your labels or use 'okteto namespace' to select a different namespace and try again"}
 		}
 		return nil, false, err
 	}
@@ -433,6 +496,9 @@ func (up *upContext) waitUntilExitOrInterrupt() error {
 			return nil
 
 		case err := <-up.Disconnect:
+			if err == errors.ErrInsufficientSpace {
+				return up.getInsufficientSpaceError(err)
+			}
 			return err
 		}
 	}
@@ -464,26 +530,23 @@ func (up *upContext) buildDevImage(ctx context.Context, d *appsv1.Deployment, cr
 	if err != nil {
 		return err
 	}
+	log.Information("Running your build in %s...", buildKitHost)
 
-	imageTag := buildCMD.GetImageTag(up.Dev.Image.Name, up.Dev.Name, up.Dev.Namespace, oktetoRegistryURL)
+	imageTag := registry.GetImageTag(up.Dev.Image.Name, up.Dev.Name, up.Dev.Namespace, oktetoRegistryURL)
 	log.Infof("building dev image tag %s", imageTag)
 
-	var imageDigest string
 	buildArgs := model.SerializeBuildArgs(up.Dev.Image.Args)
-	imageDigest, err = buildCMD.Run(ctx, buildKitHost, isOktetoCluster, up.Dev.Image.Context, up.Dev.Image.Dockerfile, imageTag, up.Dev.Image.Target, false, up.Dev.Image.CacheFrom, buildArgs, "tty")
-	if err != nil {
+	if err := buildCMD.Run(ctx, buildKitHost, isOktetoCluster, up.Dev.Image.Context, up.Dev.Image.Dockerfile, imageTag, up.Dev.Image.Target, false, up.Dev.Image.CacheFrom, buildArgs, "tty"); err != nil {
 		return fmt.Errorf("error building dev image '%s': %s", imageTag, err)
-	}
-	if imageDigest != "" {
-		imageWithoutTag := buildCMD.GetRepoNameWithoutTag(imageTag)
-		imageTag = fmt.Sprintf("%s@%s", imageWithoutTag, imageDigest)
 	}
 	for _, s := range up.Dev.Services {
 		if s.Image.Name == up.Dev.Image.Name {
 			s.Image.Name = imageTag
+			s.SetLastBuiltAnnotation()
 		}
 	}
 	up.Dev.Image.Name = imageTag
+	up.Dev.SetLastBuiltAnnotation()
 	return nil
 }
 
@@ -591,6 +654,10 @@ func (up *upContext) devMode(ctx context.Context, d *appsv1.Deployment, create b
 }
 
 func (up *upContext) forwards(ctx context.Context) error {
+	spinner := utils.NewSpinner("Connecting to your development container...")
+	spinner.Start()
+	defer spinner.Stop()
+
 	if up.Dev.RemoteModeEnabled() {
 		return up.sshForwards(ctx)
 	}
@@ -697,32 +764,14 @@ func (up *upContext) startSyncthing(ctx context.Context) error {
 	}
 
 	if err := up.Sy.WaitForPing(ctx, false); err != nil {
-		userID := pods.GetDevPodUserID(ctx, up.Dev, up.Client)
-		if up.Dev.PersistentVolumeEnabled() {
-			if userID != -1 && userID != *up.Dev.SecurityContext.RunAsUser {
-				return errors.UserError{
-					E:    fmt.Errorf("User %d doesn't have write permissions for the %s directory", userID, up.Dev.MountPath),
-					Hint: fmt.Sprintf("Set 'securityContext.runAsUser: %d' in your okteto manifest\n    After that, run 'okteto down -v' to reset the synchronization service and run 'okteto up' again", userID),
-				}
-			}
-		} else {
-			if pods.OktetoDevPodMustBeRecreated(ctx, up.Dev, up.Client) {
-				if err := pods.Destroy(ctx, up.Pod, up.Dev.Namespace, up.Client); err == nil {
-					return errors.ErrLostSyncthing
-				}
+		log.Infof("failed to ping syncthing: %s", err.Error())
+		err = up.checkOktetoStartError(ctx, "Failed to connect to the synchronization service")
+		if err == errors.ErrLostSyncthing {
+			if err := pods.Destroy(ctx, up.Pod, up.Dev.Namespace, up.Client); err != nil {
+				return fmt.Errorf("error recreating development container: %s", err.Error())
 			}
 		}
-
-		if len(up.Dev.Secrets) > 0 {
-			return errors.UserError{
-				E:    fmt.Errorf("Failed to connect to the synchronization service"),
-				Hint: fmt.Sprintf("Check your development container logs for errors: 'kubectl logs %s'\n    Check that your container can write to the destination path of your secrets\n    Run 'okteto down -v' to reset the synchronization service and try again.", up.Pod),
-			}
-		}
-		return errors.UserError{
-			E:    fmt.Errorf("Failed to connect to the synchronization service"),
-			Hint: fmt.Sprintf("Check your development container logs for errors: 'kubectl logs %s'\n    Run 'okteto down -v' to reset the synchronization service and try again.", up.Pod),
-		}
+		return err
 	}
 
 	if up.resetSyncthing {
@@ -786,16 +835,20 @@ func (up *upContext) synchronizeFiles(ctx context.Context) error {
 	}()
 
 	if err := up.Sy.WaitForCompletion(ctx, up.Dev, reporter); err != nil {
-		if err == errors.ErrUnknownSyncError {
-			analytics.TrackSyncError()
+		analytics.TrackSyncError()
+		switch err {
+		case errors.ErrLostSyncthing, errors.ErrResetSyncthing:
+			return err
+		case errors.ErrInsufficientSpace:
+			return up.getInsufficientSpaceError(err)
+		default:
 			return errors.UserError{
 				E: err,
 				Hint: `Help us improve okteto by filing an issue in https://github.com/okteto/okteto/issues/new.
-Please include the file generated by 'okteto doctor' if possible.
-Then, try to run 'okteto down -v' + 'okteto up'  again`,
+    Please include the file generated by 'okteto doctor' if possible.
+    Then, try to run 'okteto down -v' + 'okteto up'  again`,
 			}
 		}
-		return err
 	}
 
 	// render to 100
@@ -821,7 +874,7 @@ func (up *upContext) cleanCommand(ctx context.Context) {
 	in := strings.NewReader("\n")
 	var out bytes.Buffer
 
-	cmd := "cat /proc/sys/fs/inotify/max_user_watches; (cp /var/okteto/bin/* /usr/local/bin; cp /var/okteto/cloudbin/* /usr/local/bin; /var/okteto/bin/clean) >/dev/null 2>&1"
+	cmd := "cat /proc/sys/fs/inotify/max_user_watches; /var/okteto/bin/clean >/dev/null 2>&1"
 
 	err := exec.Exec(
 		ctx,
@@ -839,8 +892,6 @@ func (up *upContext) cleanCommand(ctx context.Context) {
 
 	if err != nil {
 		log.Infof("failed to clean session: %s", err)
-		up.cleaned <- out.String()
-		return
 	}
 
 	up.cleaned <- out.String()
@@ -867,6 +918,37 @@ func (up *upContext) runCommand(ctx context.Context) error {
 		os.Stderr,
 		up.Dev.Command.Values,
 	)
+}
+
+func (up *upContext) checkOktetoStartError(ctx context.Context, msg string) error {
+	userID := pods.GetDevPodUserID(ctx, up.Dev, up.Client)
+	if up.Dev.PersistentVolumeEnabled() {
+		if userID != -1 && userID != *up.Dev.SecurityContext.RunAsUser {
+			return errors.UserError{
+				E: fmt.Errorf("User %d doesn't have write permissions for the %s directory", userID, up.Dev.MountPath),
+				Hint: fmt.Sprintf(`Set 'securityContext.runAsUser: %d' in your okteto manifest.
+    After that, run 'okteto down -v' to reset your development container and run 'okteto up' again`, userID),
+			}
+		}
+	} else {
+		if pods.OktetoDevPodMustBeRecreated(ctx, up.Dev, up.Client) {
+			return errors.ErrLostSyncthing
+		}
+	}
+
+	if len(up.Dev.Secrets) > 0 {
+		return errors.UserError{
+			E: fmt.Errorf(msg),
+			Hint: fmt.Sprintf(`Check your development container logs for errors: 'kubectl logs %s',
+    Check that your container can write to the destination path of your secrets.
+    Run 'okteto down -v' to reset your development container and try again`, up.Pod),
+		}
+	}
+	return errors.UserError{
+		E: fmt.Errorf(msg),
+		Hint: fmt.Sprintf(`Check your development container logs for errors: 'kubectl logs %s'.
+    Run 'okteto down -v' to reset your development container and try again`, up.Pod),
+	}
 }
 
 func (up *upContext) getClusterType() string {
@@ -904,13 +986,26 @@ func (up *upContext) getInteractive() bool {
 	return false
 }
 
+func (up *upContext) getInsufficientSpaceError(err error) error {
+	if up.Dev.PersistentVolumeEnabled() {
+		return errors.UserError{
+			E: err,
+			Hint: `Okteto volume is full.
+    Increase your persistent volume size, run 'okteto down -v' and try 'okteto up' again.
+    More information about configuring your persistent volume at https://okteto.com/docs/reference/manifest#persistentvolume-object-optional`,
+		}
+	}
+	return errors.UserError{
+		E: err,
+		Hint: `The synchronization service is running out of space.
+    Enable persistent volumes in your okteto manifest and try again.
+    More information about configuring your persistent volume at https://okteto.com/docs/reference/manifest#persistentvolume-object-optional`,
+	}
+
+}
+
 // Shutdown runs the cancellation sequence. It will wait for all tasks to finish for up to 500 milliseconds
 func (up *upContext) shutdown() {
-	if up.Canceled {
-		return
-	}
-	up.Canceled = true
-
 	if up.isTerm {
 		if err := term.RestoreTerminal(up.inFd, up.stateTerm); err != nil {
 			log.Infof("failed to restore terminal: %s", err)
@@ -940,6 +1035,8 @@ func (up *upContext) shutdown() {
 	}
 
 	log.Info("completed shutdown sequence")
+	up.ShutdownCompleted <- true
+
 }
 
 func printDisplayContext(dev *model.Dev) {
@@ -948,9 +1045,6 @@ func printDisplayContext(dev *model.Dev) {
 	}
 	log.Println(fmt.Sprintf("    %s %s", log.BlueString("Namespace:"), dev.Namespace))
 	log.Println(fmt.Sprintf("    %s      %s", log.BlueString("Name:"), dev.Name))
-	if dev.RemoteModeEnabled() {
-		log.Println(fmt.Sprintf("    %s       %d -> %d", log.BlueString("SSH:"), dev.RemotePort, dev.SSHServerPort))
-	}
 
 	if len(dev.Forward) > 0 {
 		log.Println(fmt.Sprintf("    %s   %d -> %d", log.BlueString("Forward:"), dev.Forward[0].Local, dev.Forward[0].Remote))

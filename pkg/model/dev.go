@@ -24,9 +24,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/a8m/envsubst"
 	"github.com/google/uuid"
+	"github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/log"
 	yaml "gopkg.in/yaml.v2"
 	appsv1 "k8s.io/api/apps/v1"
@@ -57,10 +59,12 @@ const (
 	SourceCodeSubPath = "src"
 	//OktetoSyncthingMountPath syncthing volume mount path
 	OktetoSyncthingMountPath = "/var/syncthing"
-	remoteMountPath          = "/var/okteto/remote"
+	//RemoteMountPath remote volume mount path
+	RemoteMountPath = "/var/okteto/remote"
 	//SyncthingSubPath subpath in the development container persistent volume for the syncthing data
 	SyncthingSubPath = "syncthing"
-	remoteSubPath    = "okteto-remote"
+	//RemoteSubPath subpath in the development container persistent volume for the remote data
+	RemoteSubPath = "okteto-remote"
 	//OktetoAutoCreateAnnotation indicates if the deployment was auto generatted by okteto up
 	OktetoAutoCreateAnnotation = "dev.okteto.com/auto-create"
 	//OktetoRestartAnnotation indicates the dev pod must be recreated to pull the latest version of its image
@@ -88,7 +92,7 @@ const (
 
 var (
 	//OktetoBinImageTag image tag with okteto internal binaries
-	OktetoBinImageTag = "okteto/bin:1.2.11"
+	OktetoBinImageTag = "okteto/bin:1.2.14"
 
 	errBadName = fmt.Errorf("Invalid name: must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character")
 
@@ -107,13 +111,14 @@ var (
 
 //Dev represents a development container
 type Dev struct {
-	Name                 string                `json:"name" yaml:"name"`
-	Labels               map[string]string     `json:"labels,omitempty" yaml:"labels,omitempty"`
-	Annotations          map[string]string     `json:"annotations,omitempty" yaml:"annotations,omitempty"`
-	Tolerations          []apiv1.Toleration    `json:"tolerations,omitempty" yaml:"tolerations,omitempty"`
-	Context              string                `json:"context,omitempty" yaml:"context,omitempty"`
-	Namespace            string                `json:"namespace,omitempty" yaml:"namespace,omitempty"`
-	Container            string                `json:"container,omitempty" yaml:"container,omitempty"`
+	Name                 string             `json:"name" yaml:"name"`
+	Labels               map[string]string  `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Annotations          map[string]string  `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	Tolerations          []apiv1.Toleration `json:"tolerations,omitempty" yaml:"tolerations,omitempty"`
+	Context              string             `json:"context,omitempty" yaml:"context,omitempty"`
+	Namespace            string             `json:"namespace,omitempty" yaml:"namespace,omitempty"`
+	Container            string             `json:"container,omitempty" yaml:"container,omitempty"`
+	EmptyImage           bool
 	Image                *BuildInfo            `json:"image,omitempty" yaml:"image,omitempty"`
 	Push                 *BuildInfo            `json:"-" yaml:"push,omitempty"`
 	ImagePullPolicy      apiv1.PullPolicy      `json:"imagePullPolicy,omitempty" yaml:"imagePullPolicy,omitempty"`
@@ -141,6 +146,11 @@ type Dev struct {
 
 //Command represents the start command of a development contaianer
 type Command struct {
+	Values []string
+}
+
+//Args represents the args of a development contaianer
+type Args struct {
 	Values []string
 }
 
@@ -422,6 +432,9 @@ func (dev *Dev) loadImage() error {
 			return err
 		}
 	}
+	if dev.Image.Name == "" {
+		dev.EmptyImage = true
+	}
 	return nil
 }
 
@@ -585,7 +598,7 @@ func (dev *Dev) LoadRemote(pubKeyPath string) {
 		p, err := GetAvailablePort(dev.Interface)
 		if err != nil {
 			log.Infof("failed to get random port for SSH connection: %s", err)
-			p = 2222
+			p = oktetoDefaultSSHServerPort
 		}
 
 		dev.RemotePort = p
@@ -595,7 +608,7 @@ func (dev *Dev) LoadRemote(pubKeyPath string) {
 	p := Secret{
 		LocalPath:  pubKeyPath,
 		RemotePath: authorizedKeysPath,
-		Mode:       0444,
+		Mode:       0644,
 	}
 
 	log.Infof("enabled remote mode")
@@ -649,6 +662,14 @@ func SerializeBuildArgs(buildArgs []EnvVar) []string {
 	return result
 }
 
+//SetLastBuiltAnnotation sets the dev timestacmp
+func (dev *Dev) SetLastBuiltAnnotation() {
+	if dev.Annotations == nil {
+		dev.Annotations = map[string]string{}
+	}
+	dev.Annotations[labels.LastBuiltAnnotation] = time.Now().UTC().Format(labels.TimeFormat)
+}
+
 //GetVolumeName returns the okteto volume name for a given development container
 func (dev *Dev) GetVolumeName() string {
 	return fmt.Sprintf(OktetoVolumeNameTemplate, dev.Name)
@@ -671,7 +692,6 @@ func (dev *Dev) LabelsSelector() string {
 func (dev *Dev) ToTranslationRule(main *Dev) *TranslationRule {
 	rule := &TranslationRule{
 		Container:        dev.Container,
-		Image:            dev.Image.Name,
 		ImagePullPolicy:  dev.ImagePullPolicy,
 		Environment:      dev.Environment,
 		Secrets:          dev.Secrets,
@@ -681,6 +701,10 @@ func (dev *Dev) ToTranslationRule(main *Dev) *TranslationRule {
 		SecurityContext:  dev.SecurityContext,
 		Resources:        dev.Resources,
 		Healthchecks:     dev.Healthchecks,
+	}
+
+	if !dev.EmptyImage {
+		rule.Image = dev.Image.Name
 	}
 
 	if main == dev {
@@ -722,8 +746,8 @@ func (dev *Dev) ToTranslationRule(main *Dev) *TranslationRule {
 				rule.Volumes,
 				VolumeMount{
 					Name:      main.GetVolumeName(),
-					MountPath: remoteMountPath,
-					SubPath:   remoteSubPath,
+					MountPath: RemoteMountPath,
+					SubPath:   RemoteSubPath,
 				},
 			)
 		}
@@ -839,12 +863,6 @@ func (dev *Dev) GevSandbox() *appsv1.Deployment {
 // RemoteModeEnabled returns true if remote is enabled
 func (dev *Dev) RemoteModeEnabled() bool {
 	if dev == nil {
-		return false
-	}
-
-	_, ok := os.LookupEnv("OKTETO_EXECUTE_SSH")
-	if ok {
-		log.Info("execute over SSH mode enabled")
 		return true
 	}
 
@@ -852,7 +870,14 @@ func (dev *Dev) RemoteModeEnabled() bool {
 		return true
 	}
 
-	return len(dev.Reverse) > 0
+	if len(dev.Reverse) > 0 {
+		return true
+	}
+
+	if v, ok := os.LookupEnv("OKTETO_EXECUTE_SSH"); ok && v == "false" {
+		return false
+	}
+	return true
 }
 
 // GetKeyName returns the secret key name

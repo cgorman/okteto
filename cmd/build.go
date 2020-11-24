@@ -67,9 +67,10 @@ func Build(ctx context.Context) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			log.Information("Running your build in %s...", buildKitHost)
 
 			ctx := context.Background()
-			if _, err := build.Run(ctx, buildKitHost, isOktetoCluster, path, file, tag, target, noCache, cacheFrom, buildArgs, progress); err != nil {
+			if err := build.Run(ctx, buildKitHost, isOktetoCluster, path, file, tag, target, noCache, cacheFrom, buildArgs, progress); err != nil {
 				analytics.TrackBuild(false)
 				return err
 			}

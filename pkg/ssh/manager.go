@@ -32,6 +32,7 @@ type ForwardManager struct {
 	ctx             context.Context
 	sshAddr         string
 	pf              *k8sforward.PortForwardManager
+	pool            *pool
 }
 
 // NewForwardManager returns a newly initialized instance of ForwardManager
@@ -47,7 +48,7 @@ func NewForwardManager(ctx context.Context, sshAddr, localInterface, remoteInter
 	}
 }
 
-func (fm *ForwardManager) canAdd(localPort int) error {
+func (fm *ForwardManager) canAdd(localPort int, checkAvailable bool) error {
 	if _, ok := fm.reverses[localPort]; ok {
 		return fmt.Errorf("port %d is listed multiple times, please check your reverse forwards configuration", localPort)
 	}
@@ -56,12 +57,18 @@ func (fm *ForwardManager) canAdd(localPort int) error {
 		return fmt.Errorf("port %d is listed multiple times, please check your forwards configuration", localPort)
 	}
 
+	if !checkAvailable {
+		return nil
+	}
+
 	if !model.IsPortAvailable(fm.localInterface, localPort) {
 		if localPort <= 1024 {
 			os := runtime.GOOS
 			switch os {
 			case "darwin":
-				return fmt.Errorf("local port %d is privileged. Define 'interface: 0.0.0.0' in your okteto manifest and try again", localPort)
+				if fm.localInterface == model.Localhost {
+					return fmt.Errorf("local port %d is privileged. Define 'interface: 0.0.0.0' in your okteto manifest and try again", localPort)
+				}
 			case "linux":
 				return fmt.Errorf("local port %d is privileged. Try running \"sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/okteto\" and try again", localPort)
 			}
@@ -75,14 +82,13 @@ func (fm *ForwardManager) canAdd(localPort int) error {
 // Add initializes a remote forward
 func (fm *ForwardManager) Add(f model.Forward) error {
 
-	if err := fm.canAdd(f.Local); err != nil {
+	if err := fm.canAdd(f.Local, true); err != nil {
 		return err
 	}
 
 	fm.forwards[f.Local] = &forward{
 		localAddress:  fmt.Sprintf("%s:%d", fm.localInterface, f.Local),
 		remoteAddress: fmt.Sprintf("%s:%d", fm.remoteInterface, f.Remote),
-		ctx:           fm.ctx,
 	}
 
 	if f.Service {
@@ -114,15 +120,17 @@ func (fm *ForwardManager) Start(devPod, namespace string) error {
 		return err
 	}
 
+	fm.pool = pool
+
 	for _, ff := range fm.forwards {
 		ff.pool = pool
-		go ff.start()
+		go ff.start(fm.ctx)
 
 	}
 
 	for _, rt := range fm.reverses {
 		rt.pool = pool
-		go rt.start()
+		go rt.start(fm.ctx)
 	}
 
 	return nil
@@ -130,6 +138,10 @@ func (fm *ForwardManager) Start(devPod, namespace string) error {
 
 // Stop sends a stop signal to all the connections
 func (fm *ForwardManager) Stop() {
+
+	if fm.pool != nil {
+		fm.pool.stop()
+	}
 
 	if fm.pf != nil {
 		fm.pf.Stop()

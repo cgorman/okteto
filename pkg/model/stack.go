@@ -19,7 +19,9 @@ import (
 	"io/ioutil"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/okteto/okteto/pkg/k8s/labels"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -36,17 +38,22 @@ type Stack struct {
 
 //Service represents an okteto stack service
 type Service struct {
-	Public          bool         `yaml:"public,omitempty"`
-	Image           string       `yaml:"image"`
-	Build           *BuildInfo   `yaml:"build,omitempty"`
-	Replicas        int          `yaml:"replicas"`
-	Command         Command      `yaml:"command,omitempty"`
-	Environment     []EnvVar     `yaml:"environment,omitempty"`
-	EnvFiles        []string     `yaml:"env_file,omitempty"`
-	Ports           []int        `yaml:"ports,omitempty"`
-	Volumes         []string     `yaml:"volumes,omitempty"`
-	StopGracePeriod int          `yaml:"stop_grace_period,omitempty"`
-	Resources       ResourceList `yaml:"resources,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Annotations     map[string]string `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	Public          bool              `yaml:"public,omitempty"`
+	Image           string            `yaml:"image"`
+	Build           *BuildInfo        `yaml:"build,omitempty"`
+	Replicas        int               `yaml:"replicas"`
+	Command         Command           `yaml:"command,omitempty"`
+	Args            Args              `yaml:"args,omitempty"`
+	Environment     []EnvVar          `yaml:"environment,omitempty"`
+	EnvFiles        []string          `yaml:"env_file,omitempty"`
+	CapAdd          []string          `yaml:"cap_add,omitempty"`
+	CapDrop         []string          `yaml:"cap_drop,omitempty"`
+	Ports           []int             `yaml:"ports,omitempty"`
+	Volumes         []string          `yaml:"volumes,omitempty"`
+	StopGracePeriod int               `yaml:"stop_grace_period,omitempty"`
+	Resources       ResourceList      `yaml:"resources,omitempty"`
 }
 
 //GetStack returns an okteto stack object from a given file
@@ -179,4 +186,12 @@ func (s *Stack) UpdateNamespace(namespace string) error {
 	}
 	s.Namespace = namespace
 	return nil
+}
+
+//SetLastBuiltAnnotationtamp sets the dev timestacmp
+func (s *Service) SetLastBuiltAnnotationtamp() {
+	if s.Annotations == nil {
+		s.Annotations = map[string]string{}
+	}
+	s.Annotations[labels.LastBuiltAnnotation] = time.Now().UTC().Format(labels.TimeFormat)
 }

@@ -44,19 +44,13 @@ const (
 func GetBuildKitHost() (string, bool, error) {
 	buildKitHost := os.Getenv("BUILDKIT_HOST")
 	if buildKitHost != "" {
-		log.Information("Running your build in %s...", buildKitHost)
 		return buildKitHost, false, nil
 	}
 	buildkitURL, err := okteto.GetBuildKit()
 	if err != nil {
 		return "", false, err
 	}
-	if buildkitURL == okteto.CloudBuildKitURL {
-		log.Information("Running your build in Okteto Cloud...")
-	} else {
-		log.Information("Running your build in Okteto Enterprise...")
-	}
-	return buildkitURL, true, err
+	return buildkitURL, true, nil
 }
 
 //getSolveOpt returns the buildkit solve options
@@ -142,29 +136,15 @@ func getSolveOpt(buildCtx, file, imageTag, target string, noCache bool, cacheFro
 	return opt, nil
 }
 
-func getDockerFile(path, dockerFile string, isOktetoCluster bool) (string, error) {
-	if dockerFile == "" {
-		dockerFile = filepath.Join(path, "Dockerfile")
-	}
-
-	if !isOktetoCluster {
-		return dockerFile, nil
-	}
-
-	fileWithCacheHandler, err := getDockerfileWithCacheHandler(dockerFile)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to create temporary build folder")
-	}
-
-	return fileWithCacheHandler, nil
-}
-
 func getBuildkitClient(ctx context.Context, isOktetoCluster bool, buildKitHost string) (*client.Client, error) {
 	if isOktetoCluster {
 		c, err := getClientForOktetoCluster(ctx, buildKitHost)
 		if err != nil {
 			log.Infof("failed to create okteto build client: %s", err)
-			return nil, okErrors.UserError{E: fmt.Errorf("failed to create okteto build client"), Hint: okErrors.ErrNotLogged.Error()}
+			return nil, okErrors.UserError{
+				E:    fmt.Errorf("failed to create okteto build client"),
+				Hint: okErrors.ErrNotLogged.Error(),
+			}
 		}
 
 		return c, nil
@@ -208,13 +188,12 @@ func getClientForOktetoCluster(ctx context.Context, buildKitHost string) (*clien
 	return c, nil
 }
 
-func solveBuild(ctx context.Context, c *client.Client, opt *client.SolveOpt, progress string) (string, error) {
-	var solveResp *client.SolveResponse
+func solveBuild(ctx context.Context, c *client.Client, opt *client.SolveOpt, progress string) error {
 	ch := make(chan *client.SolveStatus)
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
 		var err error
-		solveResp, err = c.Solve(ctx, nil, *opt, ch)
+		_, err = c.Solve(ctx, nil, *opt, ch)
 		return errors.Wrap(err, "build failed")
 	})
 
@@ -229,9 +208,5 @@ func solveBuild(ctx context.Context, c *client.Client, opt *client.SolveOpt, pro
 		return progressui.DisplaySolveStatus(context.TODO(), "", c, os.Stdout, ch)
 	})
 
-	if err := eg.Wait(); err != nil {
-		return "", err
-	}
-
-	return solveResp.ExporterResponse["containerimage.digest"], nil
+	return eg.Wait()
 }

@@ -30,6 +30,7 @@ import (
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/registry"
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/kubernetes"
 )
@@ -194,6 +195,7 @@ func runPush(ctx context.Context, dev *model.Dev, autoDeploy bool, imageTag, okt
 
 	if !exists {
 		d.Spec.Template.Spec.Containers[0].Image = imageTag
+		deployments.SetLastBuiltAnnotation(d)
 		return deployments.Deploy(ctx, d, true, c)
 	}
 
@@ -206,6 +208,7 @@ func runPush(ctx context.Context, dev *model.Dev, autoDeploy bool, imageTag, okt
 			if devContainer == nil {
 				return fmt.Errorf("Container '%s' not found in deployment '%s'", rule.Container, d.GetName())
 			}
+			deployments.SetLastBuiltAnnotation(tr.Deployment)
 			devContainer.Image = imageTag
 		}
 	}
@@ -218,23 +221,17 @@ func buildImage(ctx context.Context, dev *model.Dev, imageTag, imageFromDeployme
 	if err != nil {
 		return "", err
 	}
+	log.Information("Running your build in %s...", buildKitHost)
 
 	if imageTag == "" {
 		imageTag = dev.Push.Name
 	}
-	buildTag := build.GetDevImageTag(dev, imageTag, imageFromDeployment, oktetoRegistryURL)
+	buildTag := registry.GetDevImageTag(dev, imageTag, imageFromDeployment, oktetoRegistryURL)
 	log.Infof("pushing with image tag %s", buildTag)
 
-	var imageDigest string
 	buildArgs := model.SerializeBuildArgs(dev.Push.Args)
-	imageDigest, err = build.Run(ctx, buildKitHost, isOktetoCluster, dev.Push.Context, dev.Push.Dockerfile, buildTag, dev.Push.Target, noCache, dev.Push.CacheFrom, buildArgs, progress)
-	if err != nil {
+	if err := build.Run(ctx, buildKitHost, isOktetoCluster, dev.Push.Context, dev.Push.Dockerfile, buildTag, dev.Push.Target, noCache, dev.Push.CacheFrom, buildArgs, progress); err != nil {
 		return "", fmt.Errorf("error building image '%s': %s", buildTag, err)
-	}
-
-	if imageDigest != "" {
-		imageWithoutTag := build.GetRepoNameWithoutTag(buildTag)
-		buildTag = fmt.Sprintf("%s@%s", imageWithoutTag, imageDigest)
 	}
 
 	return buildTag, nil

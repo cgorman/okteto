@@ -19,52 +19,89 @@ import (
 	"net"
 	"time"
 
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/log"
 	"golang.org/x/crypto/ssh"
 )
 
 type pool struct {
-	ka     time.Duration
-	ctx    context.Context
-	client *ssh.Client
+	ka      time.Duration
+	client  *ssh.Client
+	stopped bool
 }
 
 func startPool(ctx context.Context, serverAddr string, config *ssh.ClientConfig) (*pool, error) {
 	p := &pool{
-		ka:  30 * time.Second,
-		ctx: ctx,
+		ka:      30 * time.Second,
+		stopped: false,
 	}
 
-	conn, err := getTCPConnection(ctx, serverAddr, p.ka)
+	clientConn, chans, reqs, err := retryNewClientConn(ctx, serverAddr, config, p)
 	if err != nil {
-		return nil, fmt.Errorf("failed to establish a tcp connection for %s: %s", serverAddr, err)
-	}
-
-	clientConn, chans, reqs, err := ssh.NewClientConn(conn, serverAddr, config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ssh connection for %s: %w", serverAddr, err)
+		log.Infof("failed to create ssh connection for %s: %s", serverAddr, err.Error())
+		return nil, errors.ErrSSHConnectError
 	}
 
 	client := ssh.NewClient(clientConn, chans, reqs)
 
 	p.client = client
-	go p.keepAlive()
+	go p.keepAlive(ctx)
 
 	return p, nil
 }
 
-func (p *pool) keepAlive() {
+func retryNewClientConn(ctx context.Context, addr string, conf *ssh.ClientConfig, p *pool) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+	ticker := time.NewTicker(300 * time.Millisecond)
+	to := config.GetTimeout() / 10 // 3 seconds
+	timeout := time.Now().Add(to)
+
+	log.Infof("waiting for ssh to be ready %s", addr)
+	for i := 0; ; i++ {
+		conn, err := getTCPConnection(ctx, addr, p.ka)
+		if err == nil {
+			clientConn, chans, reqs, errConn := ssh.NewClientConn(conn, addr, conf)
+			if errConn == nil {
+				return clientConn, chans, reqs, nil
+			}
+			err = errConn
+		}
+
+		log.Infof("ssh is not ready yet: %s", err)
+
+		if time.Now().After(timeout) {
+			return nil, nil, nil, err
+		}
+
+		select {
+		case <-ticker.C:
+			continue
+		case <-ctx.Done():
+			log.Infof("ssh.retryNewClientConn cancelled")
+			return nil, nil, nil, fmt.Errorf("ssh.retryNewClientConn cancelled")
+		}
+	}
+}
+
+func (p *pool) keepAlive(ctx context.Context) {
 	t := time.NewTicker(p.ka)
 	defer t.Stop()
 	for {
 		select {
-		case <-p.ctx.Done():
-			if p.ctx.Err() != nil {
-				log.Infof("ssh pool keep alive completed with error: %s", p.ctx.Err())
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err != nil {
+				if err != context.Canceled {
+					log.Infof("ssh pool keep alive completed with error: %s", err)
+				}
 			}
 
 			return
 		case <-t.C:
+			if p.stopped {
+				return
+			}
+
 			if _, _, err := p.client.SendRequest("dev.okteto.com/keepalive", true, nil); err != nil {
 				log.Infof("failed to send SSH keepalive: %s", err)
 			}
@@ -106,7 +143,7 @@ func getTCPConnection(ctx context.Context, serverAddr string, keepAlive time.Dur
 func getConn(ctx context.Context, serverAddr string, maxRetries int) (net.Conn, error) {
 	var lastErr error
 	t := time.NewTicker(100 * time.Millisecond)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		d := net.Dialer{}
 		c, err := d.DialContext(ctx, "tcp", serverAddr)
 		if err == nil {
@@ -118,4 +155,13 @@ func getConn(ctx context.Context, serverAddr string, maxRetries int) (net.Conn, 
 	}
 
 	return nil, lastErr
+}
+
+func (p *pool) stop() {
+	p.stopped = true
+	if err := p.client.Close(); err != nil {
+		if !errors.IsClosedNetwork(err) {
+			log.Infof("failed to close SSH pool: %s", err)
+		}
+	}
 }

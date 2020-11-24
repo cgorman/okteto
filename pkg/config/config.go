@@ -50,7 +50,7 @@ func GetBinaryFullPath() string {
 func GetOktetoHome() string {
 	if v, ok := os.LookupEnv("OKTETO_FOLDER"); ok {
 		if !model.FileExists(v) {
-			log.Fatalf("OKTETO_FOLDER points to a non-existing directory: %s", v)
+			log.Fatalf("OKTETO_FOLDER doesn't exist: %s", v)
 		}
 
 		return v
@@ -58,6 +58,18 @@ func GetOktetoHome() string {
 
 	home := GetUserHomeDir()
 	d := filepath.Join(home, oktetoFolderName)
+
+	if err := os.MkdirAll(d, 0700); err != nil {
+		log.Fatalf("failed to create %s: %s", d, err)
+	}
+
+	return d
+}
+
+// GetNamespaceHome returns the path of the folder
+func GetNamespaceHome(namespace string) string {
+	okHome := GetOktetoHome()
+	d := filepath.Join(okHome, namespace)
 
 	if err := os.MkdirAll(d, 0700); err != nil {
 		log.Fatalf("failed to create %s: %s", d, err)
