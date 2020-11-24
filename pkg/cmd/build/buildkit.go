@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/containerd/console"
@@ -107,12 +108,18 @@ func getSolveOpt(buildCtx, file, imageTag, target string, noCache bool, cacheFro
 	}
 
 	if imageTag != "" {
+		insecure_registry_str, insecure_registry_env_ok := os.LookupEnv("OKTETO_INSECURE_REGISTRY_ENABLED")
+		if !insecure_registry_env_ok {
+			insecure_registry_str = "false"
+		}
+		insecure_registry_enabled, _ := strconv.ParseBool(insecure_registry_str)
 		opt.Exports = []client.ExportEntry{
 			{
 				Type: "image",
 				Attrs: map[string]string{
-					"name": imageTag,
-					"push": "true",
+					"name":              imageTag,
+					"push":              "true",
+					"registry.insecure": strconv.FormatBool(insecure_registry_enabled),
 				},
 			},
 		}
