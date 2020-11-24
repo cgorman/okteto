@@ -16,6 +16,7 @@ package ssh
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	k8sforward "github.com/okteto/okteto/pkg/k8s/forward"
 	"github.com/okteto/okteto/pkg/log"
@@ -55,8 +56,17 @@ func (fm *ForwardManager) canAdd(localPort int) error {
 		return fmt.Errorf("port %d is listed multiple times, please check your forwards configuration", localPort)
 	}
 
-	if !model.IsPortAvailable(localPort) {
-		return fmt.Errorf("port %d is already in use in your local machine, please check your configuration", localPort)
+	if !model.IsPortAvailable(fm.localInterface, localPort) {
+		if localPort <= 1024 {
+			os := runtime.GOOS
+			switch os {
+			case "darwin":
+				return fmt.Errorf("local port %d is privileged. Define 'interface: 0.0.0.0' in your okteto manifest and try again", localPort)
+			case "linux":
+				return fmt.Errorf("local port %d is privileged. Try running \"sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/okteto\" and try again", localPort)
+			}
+		}
+		return fmt.Errorf("local port %d is already in-use in your local machine", localPort)
 	}
 
 	return nil
@@ -107,6 +117,7 @@ func (fm *ForwardManager) Start(devPod, namespace string) error {
 	for _, ff := range fm.forwards {
 		ff.pool = pool
 		go ff.start()
+
 	}
 
 	for _, rt := range fm.reverses {
@@ -119,7 +130,6 @@ func (fm *ForwardManager) Start(devPod, namespace string) error {
 
 // Stop sends a stop signal to all the connections
 func (fm *ForwardManager) Stop() {
-	// TODO stop forwards and reverses
 
 	if fm.pf != nil {
 		fm.pf.Stop()

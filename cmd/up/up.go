@@ -54,7 +54,7 @@ import (
 const ReconnectingMessage = "Trying to reconnect to your cluster. File synchronization will automatically resume when the connection improves."
 
 var (
-	localClusters = []string{"127.", "172.", "192.", "169.", "localhost", "::1", "fe80::", "fc00::"}
+	localClusters = []string{"127.", "172.", "192.", "169.", model.Localhost, "::1", "fe80::", "fc00::"}
 )
 
 //Up starts a development container
@@ -231,7 +231,7 @@ func (up *upContext) start(autoDeploy, build bool) error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 
-	analytics.TrackUp(true, up.Dev.Name, up.getClusterType(), len(up.Dev.Services) == 0, up.isSwap, up.Dev.RemoteModeEnabled())
+	analytics.TrackUp(true, up.Dev.Name, up.getClusterType(), up.getInteractive(), len(up.Dev.Services) == 0, up.isSwap, up.Dev.RemoteModeEnabled())
 
 	go up.activateLoop(autoDeploy, build)
 
@@ -306,8 +306,12 @@ func (up *upContext) activate(isRetry, autoDeploy, build bool) error {
 		return err
 	}
 
+	if err := up.setDevContainer(d); err != nil {
+		return err
+	}
+
 	if err := up.devMode(ctx, d, create); err != nil {
-		return fmt.Errorf("couldn't activate your development container: %s", err.Error())
+		return fmt.Errorf("couldn't activate your development container (%s): %s", up.Dev.Container, err.Error())
 	}
 
 	if err := up.forwards(ctx); err != nil {
@@ -483,6 +487,21 @@ func (up *upContext) buildDevImage(ctx context.Context, d *appsv1.Deployment, cr
 	return nil
 }
 
+func (up *upContext) setDevContainer(d *appsv1.Deployment) error {
+	devContainer := deployments.GetDevContainer(&d.Spec.Template.Spec, up.Dev.Container)
+	if devContainer == nil {
+		return fmt.Errorf("container '%s' does not exist in deployment '%s'", up.Dev.Container, up.Dev.Name)
+	}
+
+	up.Dev.Container = devContainer.Name
+
+	if up.Dev.Image.Name == "" {
+		up.Dev.Image.Name = devContainer.Image
+	}
+
+	return nil
+}
+
 func (up *upContext) devMode(ctx context.Context, d *appsv1.Deployment, create bool) error {
 	spinner := utils.NewSpinner("Activating your development container...")
 	up.updateStateFile(activating)
@@ -493,17 +512,6 @@ func (up *upContext) devMode(ctx context.Context, d *appsv1.Deployment, create b
 		if err := volumes.Create(ctx, up.Dev, up.Client); err != nil {
 			return err
 		}
-	}
-
-	devContainer := deployments.GetDevContainer(&d.Spec.Template.Spec, up.Dev.Container)
-	if devContainer == nil {
-		return fmt.Errorf("container '%s' does not exist in deployment '%s'", up.Dev.Container, up.Dev.Name)
-	}
-
-	up.Dev.Container = devContainer.Name
-
-	if up.Dev.Image.Name == "" {
-		up.Dev.Image.Name = devContainer.Image
 	}
 
 	up.updateStateFile(starting)
@@ -588,7 +596,7 @@ func (up *upContext) forwards(ctx context.Context) error {
 	}
 
 	log.Infof("starting port forwards")
-	up.Forwarder = forward.NewPortForwardManager(ctx, up.RestConfig, up.Client)
+	up.Forwarder = forward.NewPortForwardManager(ctx, up.Dev.Interface, up.RestConfig, up.Client)
 
 	for _, f := range up.Dev.Forward {
 		if err := up.Forwarder.Add(f); err != nil {
@@ -609,12 +617,12 @@ func (up *upContext) forwards(ctx context.Context) error {
 
 func (up *upContext) sshForwards(ctx context.Context) error {
 	log.Infof("starting SSH port forwards")
-	f := forward.NewPortForwardManager(ctx, up.RestConfig, up.Client)
+	f := forward.NewPortForwardManager(ctx, up.Dev.Interface, up.RestConfig, up.Client)
 	if err := f.Add(model.Forward{Local: up.Dev.RemotePort, Remote: up.Dev.SSHServerPort}); err != nil {
 		return err
 	}
 
-	up.Forwarder = ssh.NewForwardManager(ctx, fmt.Sprintf(":%d", up.Dev.RemotePort), "localhost", "0.0.0.0", f)
+	up.Forwarder = ssh.NewForwardManager(ctx, fmt.Sprintf(":%d", up.Dev.RemotePort), up.Dev.Interface, "0.0.0.0", f)
 
 	if err := up.Forwarder.Add(model.Forward{Local: up.Sy.RemotePort, Remote: syncthing.ClusterPort}); err != nil {
 		return err
@@ -636,7 +644,7 @@ func (up *upContext) sshForwards(ctx context.Context) error {
 		}
 	}
 
-	if err := ssh.AddEntry(up.Dev.Name, up.Dev.RemotePort); err != nil {
+	if err := ssh.AddEntry(up.Dev.Name, up.Dev.Interface, up.Dev.RemotePort); err != nil {
 		log.Infof("failed to add entry to your SSH config file: %s", err)
 		return fmt.Errorf("failed to add entry to your SSH config file")
 	}
@@ -843,7 +851,7 @@ func (up *upContext) runCommand(ctx context.Context) error {
 	up.updateStateFile(ready)
 
 	if up.Dev.RemoteModeEnabled() {
-		return ssh.Exec(ctx, up.Dev.RemotePort, true, os.Stdin, os.Stdout, os.Stderr, up.Dev.Command.Values)
+		return ssh.Exec(ctx, up.Dev.Interface, up.Dev.RemotePort, true, os.Stdin, os.Stdout, os.Stderr, up.Dev.Command.Values)
 	}
 
 	return exec.Exec(
@@ -879,6 +887,21 @@ func (up *upContext) getClusterType() string {
 		}
 	}
 	return "remote"
+}
+
+func (up *upContext) getInteractive() bool {
+	if len(up.Dev.Command.Values) == 0 {
+		return true
+	}
+	if len(up.Dev.Command.Values) == 1 {
+		switch up.Dev.Command.Values[0] {
+		case "sh", "bash":
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // Shutdown runs the cancellation sequence. It will wait for all tasks to finish for up to 500 milliseconds

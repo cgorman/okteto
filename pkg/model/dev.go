@@ -36,6 +36,8 @@ import (
 )
 
 const (
+	//Localhost localhost
+	Localhost                   = "localhost"
 	oktetoSSHServerPortVariable = "OKTETO_REMOTE_PORT"
 	oktetoDefaultSSHServerPort  = 2222
 	//OktetoDefaultPVSize default volume size
@@ -86,7 +88,7 @@ const (
 
 var (
 	//OktetoBinImageTag image tag with okteto internal binaries
-	OktetoBinImageTag = "okteto/bin:1.2.9"
+	OktetoBinImageTag = "okteto/bin:1.2.11"
 
 	errBadName = fmt.Errorf("Invalid name: must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character")
 
@@ -131,6 +133,7 @@ type Dev struct {
 	parentSyncFolder     string                `json:"-" yaml:"-"`
 	Forward              []Forward             `json:"forward,omitempty" yaml:"forward,omitempty"`
 	Reverse              []Reverse             `json:"reverse,omitempty" yaml:"reverse,omitempty"`
+	Interface            string                `json:"interface,omitempty" yaml:"interface,omitempty"`
 	Resources            ResourceRequirements  `json:"resources,omitempty" yaml:"resources,omitempty"`
 	Services             []*Dev                `json:"services,omitempty" yaml:"services,omitempty"`
 	PersistentVolumeInfo *PersistentVolumeInfo `json:"persistentVolume,omitempty" yaml:"persistentVolume,omitempty"`
@@ -360,10 +363,8 @@ func (dev *Dev) expandEnvVars() error {
 	if err := dev.loadLabels(); err != nil {
 		return err
 	}
-	if err := dev.loadImage(); err != nil {
-		return err
-	}
-	return nil
+
+	return dev.loadImage()
 }
 
 func (dev *Dev) loadName() error {
@@ -439,6 +440,9 @@ func (dev *Dev) setDefaults() error {
 	}
 	if dev.Annotations == nil {
 		dev.Annotations = map[string]string{}
+	}
+	if dev.Interface == "" {
+		dev.Interface = Localhost
 	}
 	if dev.SSHServerPort == 0 {
 		dev.SSHServerPort = oktetoDefaultSSHServerPort
@@ -578,7 +582,7 @@ func validateSecrets(secrets []Secret) error {
 //LoadRemote configures remote execution
 func (dev *Dev) LoadRemote(pubKeyPath string) {
 	if dev.RemotePort == 0 {
-		p, err := GetAvailablePort()
+		p, err := GetAvailablePort(dev.Interface)
 		if err != nil {
 			log.Infof("failed to get random port for SSH connection: %s", err)
 			p = 2222
@@ -688,14 +692,12 @@ func (dev *Dev) ToTranslationRule(main *Dev) *TranslationRule {
 				Name:  "OKTETO_NAMESPACE",
 				Value: dev.Namespace,
 			},
-		)
-		rule.Environment = append(
-			rule.Environment,
 			EnvVar{
 				Name:  "OKTETO_NAME",
 				Value: dev.Name,
 			},
 		)
+
 		// We want to minimize environment mutations, so only reconfigure the SSH
 		// server port if a non-default is specified.
 		if dev.SSHServerPort != oktetoDefaultSSHServerPort {

@@ -59,14 +59,18 @@ func (f *forward) start() {
 	f.setConnected()
 
 	for {
-		localConn, err := localListener.Accept()
-		if err != nil {
-			log.Infof("%s -> failed to accept connection: %v", f.String(), err)
-			continue
+		select {
+		case <-f.ctx.Done():
+			return
+		default:
+			localConn, err := localListener.Accept()
+			if err != nil {
+				log.Infof("%s -> failed to accept connection: %v", f.String(), err)
+				continue
+			}
+
+			go f.handle(localConn)
 		}
-
-		go f.handle(localConn)
-
 	}
 }
 
@@ -96,7 +100,10 @@ func (f *forward) String() string {
 func (f *forward) transfer(from io.Writer, to io.Reader, quit chan struct{}) {
 	_, err := io.Copy(from, to)
 	if err != nil {
-		m := errors.Unwrap(err).Error()
+		if unwrapError := errors.Unwrap(err); unwrapError != nil {
+			err = unwrapError
+		}
+		m := err.Error()
 		if !strings.Contains(m, "use of closed network connection") {
 			log.Infof("%s -> data transfer failed: %v", f.String(), err)
 		}
